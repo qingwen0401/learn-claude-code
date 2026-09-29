@@ -48,11 +48,12 @@ SYSTEM = (
 
 
 # -- From s04: tool implementations --
-
+#shell process是由当前agent开启的、仍然处于管理状态的用popen启动的process集合
 _shell_processes: set[subprocess.Popen] = set()
+#加个锁保证不会出现并发修改问题，Rlock避免死锁
 _shell_process_lock = threading.RLock()
 
-
+#stop一个进程组，包括shell和shell的所有子进程
 def _stop_process_group(process: subprocess.Popen):
     """Stop processes that remain in the command's original process group."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -62,20 +63,21 @@ def _stop_process_group(process: subprocess.Popen):
             return
         time.sleep(0.05)
 
-
+#stop全部，复制一份然后释放锁
 def _stop_all_shell_processes():
     with _shell_process_lock:
         processes = list(_shell_processes)
     for process in processes:
         _stop_process_group(process)
 
-
+#当本进程收到 SIGTERM 时，不要按默认行为直接死掉，而是调用函数；并决定退出码
 def _handle_termination_signal(signum, _frame):
     _stop_all_shell_processes()
     raise SystemExit(128 + signum)
 
-
+#解释器正常退出前要处理的清理函数
 atexit.register(_stop_all_shell_processes)
+#专门重构SIGTERM，以及对应的入口函数
 signal.signal(signal.SIGTERM, _handle_termination_signal)
 
 
@@ -89,28 +91,30 @@ def _run_bash_process(command: str) -> tuple[str, int | None]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
+            start_new_session=True, #新增，与主agent非同一进程，因此后面killpg不会误伤主agent
         )
+        #获得lock，将进程加入前面的set
         with _shell_process_lock:
             _shell_processes.add(process)
-        stdout, stderr = process.communicate(timeout=120)
+        stdout, stderr = process.communicate(timeout=120) #等待当前process结束并读取输出
         output = (stdout + stderr).strip()
-        return (output[:50000] if output else "(no output)"), process.returncode
+        return (output[:50000] if output else "(no output)"), process.returncode #return code可以帮忙判定该进程成功还是失败
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)", None
     except OSError as error:
         return f"Error: {type(error).__name__}: {error}", None
-    finally:
+    finally: #残留进程全杀掉
         if process is not None:
             _stop_process_group(process)
             try:
                 process.wait(timeout=0.2)
             except subprocess.TimeoutExpired:
                 pass
+            #在这里从全局注册表移除该process
             with _shell_process_lock:
                 _shell_processes.discard(process)
 
-
+#exit code转化为人类可读语言
 def _format_bash_result(output: str, exit_code: int | None) -> str:
     if exit_code in (0, None):
         return output
@@ -291,7 +295,7 @@ register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
-
+#单独抽象出来，普通tool handler流程
 def call_tool(block) -> str:
     handler = TOOL_HANDLERS.get(block.name)
     try:
@@ -305,19 +309,20 @@ def call_tool(block) -> str:
 
 class BackgroundManager:
     def __init__(self):
-        self.tasks: dict[str, dict] = {}
-        self.results: dict[str, str] = {}
-        self._ready: list[str] = []
-        self._counter = 0
-        self._lock = threading.Lock()
-
+        self.tasks: dict[str, dict] = {} #str是id, dict是task的metadata比如command
+        self.results: dict[str, str] = {}#单独存task返回的result
+        self._ready: list[str] = []#执行好了但还没有被主agent收走的task list
+        self._counter = 0#用来顺序计数task id
+        self._lock = threading.Lock()#所有共享状态必须加锁
+    #后台任务的入口，接受整个tool_use block
     def start(self, block) -> str:
+        """登记并启动后台 Bash；agent_loop 之后通过 collect 回收结果。"""
         if block.name != "bash":
             raise ValueError("Only Bash commands can run in the background")
         command = block.input.get("command")
         if not isinstance(command, str) or not command.strip():
             raise ValueError("Bash command cannot be empty")
-
+        #生成id必须加锁
         with self._lock:
             self._counter += 1
             task_id = f"bg_{self._counter:04d}"
@@ -328,9 +333,9 @@ class BackgroundManager:
             }
 
         thread = threading.Thread(
-            target=self._run,
+            target=self._run, #意思是创建线程跑run函数
             args=(task_id, command),
-            daemon=True,
+            daemon=True, #daemon thread不会阻止主线程退出
         )
         try:
             thread.start()
@@ -340,8 +345,9 @@ class BackgroundManager:
             raise
         print(f"  [background] started {task_id}: {command[:60]}")
         return task_id
-
+#真正后台运行的函数，run在新建的background thread里
     def _run(self, task_id: str, command: str):
+        """在线程中执行命令，再原子更新状态供主循环收集。"""
         try:
             output, exit_code = _run_bash_process(command)
             result = _format_bash_result(output, exit_code)
@@ -357,12 +363,13 @@ class BackgroundManager:
             task["status"] = status
             self.results[task_id] = result
             self._ready.append(task_id)
-
+#整理输出给主LLM的格式化tag
     def collect(self) -> list[str]:
+        """取走已完成任务并转成通知；与 _run 共用锁保护状态。"""
         with self._lock:
             ready = []
             for task_id in self._ready:
-                task = self.tasks.pop(task_id, None)
+                task = self.tasks.pop(task_id, None) #BackgroundManager不是一个历史数据库，是个动态的，可用Pop
                 result = self.results.pop(task_id, "")
                 if task is not None:
                     ready.append((task_id, task, result))
@@ -377,7 +384,7 @@ class BackgroundManager:
                 f"  <command>{task['command']}</command>\n"
                 f"  <summary>{result[:500]}</summary>\n"
                 f"</task_notification>"
-            )
+            ) #notifications用XML-like text
             print(f"  [background] collected {task_id}: {task['status']}")
         return notifications
 
@@ -401,8 +408,9 @@ def start_background_task(block) -> str:
 def collect_background_results() -> list[str]:
     return BACKGROUND.collect()
 
-
+#真正把异步事件传回主LLM的函数，把notification添加到message里面
 def inject_background_results(messages: list) -> int:
+    """把 collect 的通知追加到对话；由 agent_loop 每轮请求模型前调用。"""
     notifications = collect_background_results()
     if not notifications:
         return 0
@@ -421,8 +429,9 @@ def inject_background_results(messages: list) -> int:
         messages.append({"role": "user", "content": blocks})
     return len(notifications)
 
-
+#后台开始task时给主llm发个占位id
 def execute_tool(block) -> str:
+    """工具分发入口：后台 Bash 返回占位符，其余工具同步执行。"""
     blocked = trigger_hooks("PreToolUse", block)
     if blocked is not None:
         return str(blocked)
@@ -447,7 +456,7 @@ def execute_tool(block) -> str:
 
 def agent_loop(messages: list):
     while True:
-        inject_background_results(messages)
+        inject_background_results(messages) #就改这一行，每次循环查看有没有其他进程result注入主llm
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,

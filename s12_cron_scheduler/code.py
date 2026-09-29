@@ -172,7 +172,7 @@ def trigger_hooks(event: str, *args):
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
 DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
-
+#有一点线程上的小区别，非主线程不过申则不走用户确认直接拒绝
 def request_permission(block, reason: str) -> str | None:
     if threading.current_thread() is not threading.main_thread():
         return "Permission denied: scheduled turns cannot request interactive approval"
@@ -253,15 +253,15 @@ class CronJob:
     prompt: str
     recurring: bool
     durable: bool
-    pending_delivery: bool = False
-    last_fired: str | None = None
+    pending_delivery: bool = False #表示这个job是否已经进入投递queue中（但还没有确认模型收到）
+    last_fired: str | None = None #记录当前job最近在哪一分钟被触发过，避免同一分钟几秒内重复触发
 
 
-scheduled_jobs: dict[str, CronJob] = {}
-cron_queue: list[CronJob] = []
-cron_lock = threading.RLock()
+scheduled_jobs: dict[str, CronJob] = {} #所有jobs
+cron_queue: list[CronJob] = [] #已经due等待返回模型的job
+cron_lock = threading.RLock() #schedule_job()和save_durable_job()需要重复aquire同一个锁，所以Rlock
 
-
+#cron解析器（支持四种表示方法）
 def _cron_field_matches(field: str, value: int) -> bool:
     if field == "*":
         return True
@@ -275,14 +275,15 @@ def _cron_field_matches(field: str, value: int) -> bool:
         return int(start) <= value <= int(end)
     return value == int(field)
 
-
+#解析出来的五个字段进行合并
 def cron_matches(cron_expr: str, moment: datetime) -> bool:
+    """判断时刻是否匹配五段 cron；poll_due_jobs 用它筛选到期任务。"""
     fields = cron_expr.strip().split()
     if len(fields) != 5:
         return False
 
     minute, hour, day, month, weekday = fields
-    cron_weekday = (moment.weekday() + 1) % 7
+    cron_weekday = (moment.weekday() + 1) % 7 #python中monday是0，和cron不一样，进行一个转化
     if not (
         _cron_field_matches(minute, moment.minute)
         and _cron_field_matches(hour, moment.hour)
@@ -334,6 +335,7 @@ def _validate_cron_field(field: str, minimum: int, maximum: int) -> str | None:
 
 
 def validate_cron(cron_expr: str) -> str | None:
+    """校验字段数、字段格式与取值范围；schedule_job 在持锁前调用。"""
     fields = cron_expr.strip().split()
     if len(fields) != 5:
         return f"Expected 5 fields, got {len(fields)}"
@@ -351,8 +353,9 @@ def validate_cron(cron_expr: str) -> str | None:
             return f"{name}: {error}"
     return None
 
-
+#保存所有durable=true的
 def save_durable_jobs():
+    """原子写入 durable job 快照；注册、触发和 ack/cancel 路径都会调用。"""
     with cron_lock:
         payload = [
             asdict(job)
@@ -360,7 +363,7 @@ def save_durable_jobs():
             if job.durable
         ]
         temporary = DURABLE_PATH.with_name(
-            f"{DURABLE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+            f"{DURABLE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp" #也把threadid写进文件名里
         )
         try:
             temporary.write_text(json.dumps(payload, indent=2))
@@ -370,6 +373,7 @@ def save_durable_jobs():
 
 
 def load_durable_jobs():
+    """启动时恢复持久任务，并把已 pending 的投递重新放回 cron_queue。"""
     if not DURABLE_PATH.exists():
         return
     try:
@@ -383,7 +387,7 @@ def load_durable_jobs():
     loaded = 0
     with cron_lock:
         for item in payload:
-            try:
+            try: #每一条持久化的job都要重新验证
                 job = CronJob(**item)
                 error = validate_cron(job.cron)
                 if error:
@@ -410,9 +414,10 @@ def new_cron_id() -> str:
             return job_id
     raise RuntimeError("Could not allocate a cron job ID")
 
-
+#创建一个cron job，要拿锁
 def schedule_job(cron: str, prompt: str, recurring: bool = True,
                  durable: bool = True) -> CronJob | str:
+    """校验并登记任务；durable 保存失败时回滚内存中的新增记录。"""
     error = validate_cron(cron)
     if error:
         return error
@@ -437,7 +442,7 @@ def schedule_job(cron: str, prompt: str, recurring: bool = True,
     print(f"  [cron] scheduled {job.id}: {cron} -> {prompt[:60]}")
     return job
 
-
+#带rollback的cancel
 def cancel_job(job_id: str) -> str:
     with cron_lock:
         job = scheduled_jobs.get(job_id)
@@ -457,7 +462,7 @@ def cancel_job(job_id: str) -> str:
     print(f"  [cron] cancelled {job_id}")
     return f"Cancelled {job_id}"
 
-
+#cron到期后操作，先落盘再入队
 def _enqueue_due_job(job: CronJob, minute_marker: str | None = None):
     old_pending = job.pending_delivery
     old_last_fired = job.last_fired
@@ -473,8 +478,9 @@ def _enqueue_due_job(job: CronJob, minute_marker: str | None = None):
         raise
     cron_queue.append(job)
 
-
+#每次入队前检查
 def poll_due_jobs(moment: datetime):
+    """调度线程每分钟调用：匹配任务后先持久化 pending，再放入队列。"""
     minute_marker = moment.strftime("%Y-%m-%d %H:%M")
     with cron_lock:
         for job in list(scheduled_jobs.values()):
@@ -487,32 +493,34 @@ def poll_due_jobs(moment: datetime):
             except Exception as error:
                 print(f"  [cron] could not enqueue {job.id}: {error}")
 
-
+#从queue里拿出来（但pending没变）
 def consume_cron_queue() -> list[CronJob]:
+    """取出待投递快照；成功后由 acknowledge 确认，失败则 restore。"""
     with cron_lock:
         jobs = list(cron_queue)
         cron_queue.clear()
     return jobs
 
-
+#尝试deliver给模型的东西，修改pending状态代表ack
 def acknowledge_cron_jobs(jobs: list[CronJob]):
-    changed: list[tuple[CronJob, bool]] = []
-    removed: list[CronJob] = []
+    """模型成功接收后清除 pending；一次性任务同时删除，落盘失败回滚。"""
+    changed: list[tuple[CronJob, bool]] = [] #修改过pending状态的job
+    removed: list[CronJob] = [] #删除一次性的job
     with cron_lock:
         for delivered in jobs:
             current = scheduled_jobs.get(delivered.id)
             if current is None:
                 continue
             changed.append((current, current.pending_delivery))
-            if current.recurring:
+            if current.recurring: #代表recurring job成功投递
                 current.pending_delivery = False
-            else:
+            else: #一次性的成功投递直接删
                 removed.append(current)
                 scheduled_jobs.pop(current.id)
 
         try:
             if any(job.durable for job, _ in changed):
-                save_durable_jobs()
+                save_durable_jobs() #保存ack状态
         except Exception:
             for job in removed:
                 scheduled_jobs[job.id] = job
@@ -524,8 +532,9 @@ def acknowledge_cron_jobs(jobs: list[CronJob]):
                     cron_queue.append(job)
             raise
 
-
+#Scheduled Prompt 还没成功到达模型，API 调用就失败了的处理
 def restore_cron_jobs(jobs: list[CronJob]):
+    """模型请求失败时恢复未确认任务，保证下轮仍能重试投递。"""
     with cron_lock:
         queued_ids = {job.id for job in cron_queue}
         for delivered in jobs:
@@ -550,7 +559,7 @@ def run_schedule_cron(cron: str, prompt: str, recurring: bool = True,
         return f"Error: {result}"
     return f"Scheduled {result.id}: {cron} -> {prompt}"
 
-
+#面向 Agent/用户的简化 schedule view。
 def run_list_crons() -> str:
     with cron_lock:
         jobs = list(scheduled_jobs.values())
@@ -578,7 +587,7 @@ TOOLS.extend([
      "input_schema": {"type": "object",
                       "properties": {
                           "cron": {"type": "string"},
-                          "prompt": {"type": "string"},
+                          "prompt": {"type": "string"}, #调的是prompt不是command
                           "recurring": {"type": "boolean"},
                           "durable": {"type": "boolean"}},
                       "required": ["cron", "prompt"]}},
@@ -613,14 +622,14 @@ def execute_tool(block) -> str:
 
 # -- Scheduler and agent loop --
 
-RUNTIME_STOP = threading.Event()
-runtime_threads: list[threading.Thread] = []
-runtime_started = False
+RUNTIME_STOP = threading.Event() #一个事件，用于通知两个thread准备退出了
+runtime_threads: list[threading.Thread] = [] #保存cron-scheduler，cron-queue-processor两个对象
+runtime_started = False #防止一个Cronjob被多个schedular检查
 runtime_lock = threading.Lock()
 agent_lock = threading.Lock()
 session_history: list = []
 
-
+#每一秒醒来一次，检查
 def cron_scheduler_loop(stop_event: threading.Event = RUNTIME_STOP):
     while not stop_event.wait(1.0):
         poll_due_jobs(datetime.now())
@@ -628,12 +637,12 @@ def cron_scheduler_loop(stop_event: threading.Event = RUNTIME_STOP):
 
 def agent_loop(messages: list, context: dict | None = None):
     fired = consume_cron_queue()
-    scheduled_start = len(messages)
+    scheduled_start = len(messages) #添加schedule message之前记录长度，方便rollback
     for job in fired:
         messages.append({"role": "user", "content": f"[Scheduled] {job.prompt}"})
         print(f"  [cron] delivered {job.id}: {job.prompt[:60]}")
 
-    waiting_for_ack = list(fired)
+    waiting_for_ack = list(fired) #这一批 Job 已经从 queue 取出来、已经注入 messages，但模型还没有确认收到
     while True:
         try:
             response = client.messages.create(
@@ -693,7 +702,7 @@ def print_latest_assistant_text(messages: list):
                     print(block.get("text", ""))
         return
 
-
+#统一了主agent和调度线程的两个入口
 def run_agent_turn_locked(user_query: str | None = None):
     if user_query is not None:
         trigger_hooks("UserPromptSubmit", user_query)
@@ -702,7 +711,7 @@ def run_agent_turn_locked(user_query: str | None = None):
     print_latest_assistant_text(session_history)
     print()
 
-
+#负责“到期 Job 能不能现在启动 Agent？”
 def queue_processor_loop(stop_event: threading.Event = RUNTIME_STOP):
     while not stop_event.wait(0.2):
         if not has_cron_queue() or not agent_lock.acquire(blocking=False):
@@ -711,7 +720,7 @@ def queue_processor_loop(stop_event: threading.Event = RUNTIME_STOP):
             if has_cron_queue():
                 run_agent_turn_locked()
         finally:
-            agent_lock.release()
+            agent_lock.release() #agentloop和print之间有一个异常，不能一直占着锁
 
 
 def start_runtime_threads():
@@ -719,19 +728,19 @@ def start_runtime_threads():
     with runtime_lock:
         if runtime_started:
             return
-        load_durable_jobs()
+        load_durable_jobs() #先不启动线程，先恢复durable jobs
         RUNTIME_STOP.clear()
         runtime_threads.extend([
             threading.Thread(
                 target=cron_scheduler_loop,
                 name="cron-scheduler",
                 daemon=True,
-            ),
+            ),# 只做时间匹配和enque
             threading.Thread(
                 target=queue_processor_loop,
                 name="cron-queue-processor",
                 daemon=True,
-            ),
+            ),#等待agent lock, 执行agent turn
         ])
         for thread in runtime_threads:
             thread.start()
@@ -743,7 +752,7 @@ def stop_runtime_threads():
     with runtime_lock:
         if not runtime_started:
             return
-        RUNTIME_STOP.set()
+        RUNTIME_STOP.set() #通知两个线程，请退出
         for thread in runtime_threads:
             thread.join(timeout=1)
         runtime_threads.clear()

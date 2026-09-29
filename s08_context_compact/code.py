@@ -227,6 +227,7 @@ def execute_tool(block) -> str:
 # -- Context compaction --
 
 class ContextCompactor:
+    """管理上下文预算：先压缩工具结果，再裁剪历史，超限时生成摘要并保留 transcript。"""
     CONTEXT_CHAR_LIMIT = 50000
     TOOL_RESULT_BATCH_CHAR_LIMIT = 200000
     LARGE_RESULT_CHAR_LIMIT = 30000
@@ -242,6 +243,7 @@ class ContextCompactor:
 
     @staticmethod
     def estimate_chars(messages: list) -> int:
+        """用 JSON 字符数近似估算请求大小，作为压缩触发指标。"""
         return len(json.dumps(messages, default=str, ensure_ascii=False))
 
     @staticmethod
@@ -268,6 +270,7 @@ class ContextCompactor:
         )
 
     def write_transcript(self, messages: list) -> Path:
+        """把完整消息历史追加保存为 JSONL，压缩后仍可追溯原始上下文。"""
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
         path = self.transcript_dir / f"transcript_{uuid.uuid4().hex}.jsonl"
         with path.open("x") as transcript:
@@ -276,6 +279,7 @@ class ContextCompactor:
         return path
 
     def persist_large_output(self, tool_use_id: str, output: str) -> str:
+        """大工具输出落盘，仅在上下文中保留路径和预览，避免 token 爆炸。"""
         if len(output) <= self.LARGE_RESULT_CHAR_LIMIT:
             return output
         self.tool_results_dir.mkdir(parents=True, exist_ok=True)
@@ -286,6 +290,7 @@ class ContextCompactor:
         return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
 
     def tool_result_budget(self, messages: list, max_chars: int | None = None) -> list:
+        """按批次限制 tool_result 总字符数，优先外置最大的结果。"""
         if not messages:
             return messages
         content = messages[-1].get("content")
@@ -306,6 +311,7 @@ class ContextCompactor:
         return messages
 
     def snip_compact(self, messages: list, max_messages: int = 50) -> list:
+        """裁剪旧消息并插入归档标记，同时避免拆开 tool_use/tool_result 配对。"""
         if len(messages) <= max_messages:
             return messages
         head_end = 3
@@ -324,6 +330,7 @@ class ContextCompactor:
         return [*messages[:head_end], marker, *messages[tail_start:]]
 
     def micro_compact(self, messages: list) -> list:
+        """保留最近工具结果，较早结果替换成引用或省略标记。"""
         results = [
             block
             for message in messages
@@ -357,6 +364,7 @@ class ContextCompactor:
                 + conversation[-tail:])
 
     def summarize_history(self, messages: list) -> str:
+        """调用独立摘要请求提取目标、决策、文件和约束，不执行历史中的指令。"""
         response = self.client.messages.create(
             model=self.model,
             system=(
@@ -380,12 +388,14 @@ class ContextCompactor:
         )}
 
     def compact_history(self, messages: list, active_request: str) -> list:
+        """完整压缩：保存 transcript、生成摘要，并用单条 summary 消息重建上下文。"""
         transcript = self.write_transcript(messages)
         print(f"[transcript saved: {transcript}]")
         summary = self.summarize_history(messages)
         return [self.summary_message("Compacted", active_request, summary, transcript)]
 
     def reactive_compact(self, messages: list, active_request: str) -> list:
+        """请求因超长失败时的应急压缩，保留最近消息后重试一次。"""
         transcript = self.write_transcript(messages)
         print(f"[transcript saved: {transcript}]")
         tail_start = max(0, len(messages) - self.KEEP_RECENT_MESSAGES)
@@ -398,6 +408,7 @@ class ContextCompactor:
         return [message, *messages[tail_start:]] if tail_start else [message]
 
     def prepare(self, messages: list, active_request: str) -> list:
+        """每轮模型调用前执行分层压缩；只有估算仍超限才触发摘要压缩。"""
         messages = self.tool_result_budget(messages)
         messages = self.snip_compact(messages)
         messages = self.micro_compact(messages)
@@ -412,6 +423,7 @@ MAX_REACTIVE_RETRIES = 1
 
 
 def agent_loop(messages: list, active_request: str):
+    """将上下文准备、模型调用、工具执行和 prompt-too-long 重试串成主循环。"""
     reactive_retries = 0
     while True:
         messages[:] = COMPACTOR.prepare(messages, active_request)

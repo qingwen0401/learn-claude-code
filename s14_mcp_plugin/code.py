@@ -164,8 +164,9 @@ class MCPClient:
         self.name = name
         self.tools: list[dict] = []
         self._handlers: dict[str, callable] = {}
-
+#给 MCP server 注册工具
     def register(self, tool_defs: list[dict], handlers: dict[str, callable]):
+        """校验 tools/list 元数据与 handler 一一对应，再保存 server 工具表。"""
         names = [tool.get("name") for tool in tool_defs]
         if any(not isinstance(name, str) or not name for name in names):
             raise ValueError("Every MCP tool needs a non-empty name")
@@ -176,8 +177,9 @@ class MCPClient:
             raise ValueError(f"Missing MCP handlers: {', '.join(missing)}")
         self.tools = list(tool_defs)
         self._handlers = dict(handlers)
-
+#MCP执行：就是调handler
     def call_tool(self, tool_name: str, args: dict) -> str:
+        """执行 tools/call 对应 handler；把异常转换成可返回给模型的错误文本。"""
         handler = self._handlers.get(tool_name)
         if not handler:
             return f"MCP error: unknown tool '{tool_name}'"
@@ -199,17 +201,17 @@ MCP_HOST_POLICY = {
     ("deploy", "trigger"): "confirm",
 }
 
-
+#mcp名字标准化
 def normalize_mcp_name(name: str) -> str:
     """Replace characters outside the model tool-name alphabet."""
-    normalized = _DISALLOWED_CHARS.sub("_", name)
+    normalized = _DISALLOWED_CHARS.sub("_", name) #除了字母数字和两个符号外，全部替换成下划线
     if not normalized:
         raise ValueError("MCP names cannot normalize to an empty string")
     return normalized
 
-
+#模拟 MCP server
 def _mock_server_docs() -> MCPClient:
-    server = MCPClient("docs")
+    server = MCPClient("docs") #创建MCPClient class的docs server
     server.register(
         tool_defs=[
             {
@@ -275,8 +277,10 @@ MOCK_SERVERS = {
     "deploy": _mock_server_deploy,
 }
 
-
+#连接到一个指定的mcp server并识别相关工具
 def connect_mcp(name: str) -> str:
+    """通过 server 工厂建立连接并登记 client；下一轮 assemble_tool_pool 才暴露工具。"""
+    """连接允许的 server 并登记 client；后续 assemble_tool_pool 才暴露其工具。"""
     if name in mcp_clients:
         return f"MCP server '{name}' already connected"
     factory = MOCK_SERVERS.get(name)
@@ -309,9 +313,10 @@ CONNECT_TOOL = {
 BUILTIN_TOOLS = [*BASE_TOOLS, CONNECT_TOOL]
 BUILTIN_HANDLERS = {**BASE_HANDLERS, "connect_mcp": run_connect_mcp}
 
-
+#把内置工具和mcp工具二者合并，加到tools,handler和policy中
 def assemble_tool_pool() -> tuple[list[dict], dict[str, callable]]:
     """Combine built-in tools with every connected server tool."""
+    # 将 server 工具名加前缀并生成 schema/handler/policy，作为 agent_loop 的工具池。
     global mcp_tool_policies
     tools = list(BUILTIN_TOOLS)
     handlers = dict(BUILTIN_HANDLERS)
@@ -326,7 +331,7 @@ def assemble_tool_pool() -> tuple[list[dict], dict[str, callable]]:
         for tool_def in server.tools:
             raw_name = tool_def["name"]
             safe_tool = normalize_mcp_name(raw_name)
-            prefixed = f"mcp__{safe_server}__{safe_tool}"
+            prefixed = f"mcp__{safe_server}__{safe_tool}" #遍历服务器名字和工具，生成最终llm看到的工具名字
             if len(prefixed) > 64:
                 raise ValueError(f"MCP tool name is longer than 64 characters: {prefixed}")
             origin = f"MCP tool {server_name!r}/{raw_name!r}"
@@ -347,7 +352,7 @@ def assemble_tool_pool() -> tuple[list[dict], dict[str, callable]]:
             handlers[prefixed] = (
                 lambda *, client=server, tool=raw_name, **kwargs:
                 client.call_tool(tool, kwargs)
-            )
+            )#动态handler在这里生成
             policies[prefixed] = MCP_HOST_POLICY.get(
                 (server_name, raw_name), "confirm"
             )
@@ -448,6 +453,7 @@ register_hook("Stop", summary_hook)
 
 
 def execute_tool(block, handlers: dict[str, callable]) -> str:
+    """按工具池 handler 执行模型调用；MCP 工具仍经过统一 hook/权限链。"""
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
         return str(blocked)
@@ -465,9 +471,10 @@ def execute_tool(block, handlers: dict[str, callable]) -> str:
 # -- Agent loop with a dynamic tool pool --
 
 def agent_loop(messages: list):
+    """每轮重建动态工具池，让刚连接的 MCP 工具可在下一次模型调用中使用。"""
     while True:
         try:
-            tools, handlers = assemble_tool_pool()
+            tools, handlers = assemble_tool_pool() #在这里动态扫描mcp，选择是否要新增handler
             response = client.messages.create(
                 model=MODEL,
                 system=assemble_system_prompt(),

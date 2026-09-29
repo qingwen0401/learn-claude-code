@@ -50,6 +50,7 @@ MODEL = os.environ["MODEL_ID"]
 # -- Skill catalog --
 
 class SkillLoader:
+    """扫描技能清单并按需提供完整 SKILL.md，避免启动时把全部指令塞进上下文。"""
     def __init__(self, skills_dir: Path):
         self.skills_dir = skills_dir
         self.skills: dict[str, dict[str, str]] = {}
@@ -57,6 +58,7 @@ class SkillLoader:
 
     @staticmethod
     def parse_frontmatter(text: str) -> tuple[dict, str]:
+        """解析 YAML front matter，返回元数据和正文；格式异常时安全降级。"""
         if not text.startswith("---"):
             return {}, text
         parts = text.split("---", 2)
@@ -71,6 +73,7 @@ class SkillLoader:
         return metadata, parts[2].lstrip()
 
     def scan(self):
+        """发现 skills/*/SKILL.md，建立 name -> description/content 索引。"""
         self.skills.clear()
         if not self.skills_dir.exists():
             return
@@ -88,6 +91,7 @@ class SkillLoader:
             }
 
     def catalog(self) -> str:
+        """生成放入 system prompt 的轻量技能目录，只暴露名称和摘要。"""
         if not self.skills:
             return "(no skills found)"
         return "\n".join(
@@ -96,6 +100,7 @@ class SkillLoader:
         )
 
     def load(self, name: str) -> str:
+        """按技能名返回完整指令；未知名称返回可诊断错误。"""
         skill = self.skills.get(name)
         if skill:
             return skill["content"]
@@ -107,6 +112,7 @@ SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
 
 def build_system_prompt() -> str:
+    """把技能目录注入系统提示，模型随后通过 load_skill 按需加载正文。"""
     return (
         f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
         "Act, don't explain.\n\n"
@@ -293,6 +299,7 @@ register_hook("Stop", summary_hook)
 
 
 def execute_tool(block) -> str:
+    """执行工具并运行权限/日志/输出 hooks，统一转成 tool_result 文本。"""
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
         return str(blocked)
@@ -308,6 +315,7 @@ def execute_tool(block) -> str:
 
 
 def agent_loop(messages: list):
+    """在普通 agent loop 中增加 load_skill 分发，技能内容通过工具结果回流。"""
     while True:
         response = client.messages.create(
             model=MODEL,

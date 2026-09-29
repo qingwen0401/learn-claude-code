@@ -69,6 +69,7 @@ def run_bash(command: str) -> str:
 # -- New in s02: four tools --
 
 def safe_path(p: str) -> Path:
+    """解析路径并限制在工作区内；所有文件工具先经过此边界检查。"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -76,6 +77,7 @@ def safe_path(p: str) -> Path:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """读取文件，可选截断行数，供 read_file 工具调用。"""
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -86,6 +88,7 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """创建父目录并写文件，供 write_file 工具调用。"""
     try:
         file_path = safe_path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +99,7 @@ def run_write(path: str, content: str) -> str:
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """将文件中的首个精确文本替换为新文本，供 edit_file 工具调用。"""
     try:
         file_path = safe_path(path)
         text = file_path.read_text()
@@ -108,6 +112,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 def run_glob(pattern: str) -> str:
+    """在工作区内按 glob 查找文件，过滤越界结果。"""
     import glob as g
     try:
         results = []
@@ -140,6 +145,7 @@ TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,
 }
+# 调用逻辑：模型返回 block.name -> TOOL_HANDLERS 查表 -> handler(**block.input)。
 
 
 # -- The agent loop keeps the same shape as s01; only dispatch changes --
@@ -147,6 +153,7 @@ TOOL_HANDLERS = {
 # s02: output = TOOL_HANDLERS[block.name](**block.input)
 
 def agent_loop(messages: list):
+    """复用 s01 循环，仅把硬编码的 bash 执行替换为通用工具分发。"""
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,

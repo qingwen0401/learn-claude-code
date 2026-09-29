@@ -123,9 +123,11 @@ TOOL_HANDLERS = {
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
 def register_hook(event: str, callback):
+    """按事件注册回调；扩展能力集中在 HOOKS，不污染 agent_loop。"""
     HOOKS[event].append(callback)
 
 def trigger_hooks(event: str, *args):
+    """按注册顺序执行回调；首个非 None 返回值作为阻断信号。"""
     for callback in HOOKS[event]:
         result = callback(*args)
         if result is not None:  # A hook result blocks this tool call.
@@ -175,11 +177,13 @@ def large_output_hook(block, output):
 
 # UserPromptSubmit hook: log user input before it reaches the LLM
 def context_inject_hook(query: str):
+    """UserPromptSubmit 生命周期点：在请求进入模型前执行上下文相关逻辑。"""
     print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
     return None
 
 # Stop hook: print summary when loop is about to exit
 def summary_hook(messages: list):
+    """Stop 生命周期点：模型准备结束时汇总本轮工具调用。"""
     tool_count = sum(1 for m in messages
                      for b in (m.get("content") if isinstance(m.get("content"), list) else [])
                      if isinstance(b, dict) and b.get("type") == "tool_result")
@@ -198,6 +202,7 @@ register_hook("Stop", summary_hook)
 # s04: if trigger_hooks("PreToolUse", block): ...
 
 def agent_loop(messages: list):
+    """通过 Pre/Post/Stop hook 包围工具执行，循环主体只保留编排逻辑。"""
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,

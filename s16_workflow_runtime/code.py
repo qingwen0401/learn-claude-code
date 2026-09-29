@@ -40,7 +40,7 @@ MISS = object()                        # journal cache miss sentinel
 WORKFLOW_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 RUN_ID_RE = re.compile(r"^wf_[A-Za-z0-9][A-Za-z0-9._-]{0,63}_[0-9a-f]{16}$")
 
-
+ #生成一个跨进程稳定的字符串哈希值（整数），用来替代 Python 内置的 hash()，因为内置 hash() 在不同进程中会对相同字符串产生不同的结果
 def _stable_hash(s: str) -> int:
     """Process-stable hash (Python's hash() is salted per process, which would
     break resume keys across `run` and `resume`)."""
@@ -50,7 +50,7 @@ def _stable_hash(s: str) -> int:
 def create_run_id(meta) -> str:
     return f"wf_{meta['name']}_{secrets.token_hex(8)}"
 
-
+#先占坑，再执行
 def reserve_run_id(meta) -> str:
     """Reserve a fresh run identity before any journal can be truncated."""
     STORE.mkdir(parents=True, exist_ok=True)
@@ -58,7 +58,7 @@ def reserve_run_id(meta) -> str:
         run_id = validate_run_id(create_run_id(meta))
         snapshot_path = STORE / f"{run_id}.json"
         try:
-            fd = os.open(snapshot_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            fd = os.open(snapshot_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600) #保证2个线程同时创建不会覆盖
         except FileExistsError:
             continue
         os.close(fd)
@@ -86,6 +86,7 @@ _run_locks: dict[str, threading.Lock] = {}
 
 
 @contextmanager
+#一个锁，两个workflow不能同时
 def workflow_run_lock(run_id: str):
     """Hold one run across threads and host processes for its full lifecycle."""
     with _run_locks_guard:
@@ -213,10 +214,9 @@ class RunnerOutput:
     value: object
     tokens: int
 
-
+#不会请求llm的模拟mock class，用于测试
 class MockAgentRunner:
     """Deterministic runner used by demo mode and unit tests."""
-
     def run(self, prompt, schema=None, label=None):
         if schema is None:
             value = f"[mock] {(label or prompt)[:60]}"
@@ -273,7 +273,7 @@ def _parse_runner_json(text: str) -> object:
             return value
         raise WorkflowInputError("workflow agent returned invalid JSON")
 
-
+#Runner是模型执行层，这里真正调用api
 class AnthropicAgentRunner:
     """Run workflow agents through the same API client as the host."""
 
@@ -319,6 +319,7 @@ RUNNER_FACTORY = MockAgentRunner
 
 # -- Journal --
 class WorkflowJournal:
+    #只增加，不修改
     """Append-only <runId>.journal.jsonl. On resume, agent() calls whose
     semantic key is already present are replayed from cache instead of re-run."""
 
@@ -432,22 +433,22 @@ class ExecutionState:
     def __init__(self, task, journal, runner, budget, args, depth=0, limits=None):
         self.task = task
         self.journal = journal
-        self.runner = runner
+        self.runner = runner #真正执行的模型，比如MockAgentRunner
         self.budget = budget
         self.args = args
         self._depth = depth
         self._phase = None
         self._phases_seen = set()
         self._limits = limits or ExecutionLimits()
-
+#ctx.phase("Review")后所有agent处于review阶段
     def phase(self, title):
         """Start a phase; subsequent agent()s group under it. Upsert: emitting the
         same phase again (e.g. from each pipeline item) does not re-announce it."""
         self._phase = title
-        if title not in self._phases_seen:
+        if title not in self._phases_seen: #去重
             self._phases_seen.add(title)
             self.task.progress_event("workflow_phase", title=title)
-
+#workflow自己输出事件
     def log(self, message):
         """Emit a workflow_log progress line."""
         self.task.progress_event("workflow_log", message=message)
@@ -455,13 +456,13 @@ class ExecutionState:
     async def agent(self, prompt, schema=None, label=None, phase=None):
         """Spawn one subagent. With a schema, force StructuredOutput + validate
         (retry once). On resume, a cached key short-circuits the run."""
-        label = label or (prompt[:24] + "...")
-        self._limits.claim_agent()
+        label = label or (prompt[:24] + "...") #生成有省略的label，为了日志好看
+        self._limits.claim_agent() #限制claim_agent()的agent budget
         if self.budget.remaining() <= 0:
             raise WorkflowInputError("token budget exceeded")
 
         key = self.journal.key("agent", label, prompt, schema)
-        cached = self.journal.cached(key)
+        cached = self.journal.cached(key) #检查以前有没有执行
         if cached is not MISS:
             if schema is not None:
                 ok, err = SimpleJsonSchema(schema).validate(cached)
@@ -471,8 +472,8 @@ class ExecutionState:
                     )
             self.task.progress_event("workflow_agent", label=label,
                                      phase=phase or self._phase, status="cached")
-            return cached
-
+            return cached #如果执行过，直接返回cached内容
+        #如果之前没执行过，限制agent数量
         async with self._limits.semaphore:
             run = await asyncio.to_thread(
                 self.runner.run, prompt, schema, label
@@ -498,15 +499,15 @@ class ExecutionState:
         self.budget.add(tokens)
         self.task.usage["agents"] += 1
         self.task.usage["tokens"] += tokens
-        self.journal.record(key, result)
+        self.journal.record(key, result) #成功后保存到journal
         self.task.progress_event("workflow_agent", label=label,
                                  phase=phase or self._phase, status="done")
         return result
 
     async def parallel(self, thunks):
         """BARRIER: run all thunks concurrently and fail if any thunk fails."""
-        return await asyncio.gather(*[thunk() for thunk in thunks])
-
+        return await asyncio.gather(*[thunk() for thunk in thunks]) #同时执行
+    #允许不同任务（每个有多个stage），互相穿插
     async def pipeline(self, items, *stages):
         """Per-item staged flow, NO barrier between stages: item A can be in
         stage 3 while item B is still in stage 1. Each stage gets
@@ -517,7 +518,7 @@ class ExecutionState:
                 value = await stage(value, item, idx)
             return value
         return await asyncio.gather(*[run_item(it, i) for i, it in enumerate(items)])
-
+    #嵌套workflow，但最多一层
     async def workflow(self, name, args=None):
         """Run a saved workflow inline as a child (one level), sharing this run's
         journal + budget + agent counter."""
@@ -538,16 +539,27 @@ class WorkflowTool:
     creates runId/taskId, registers a LocalWorkflowTask, and emits lifecycle
     events while executing the script. It returns the result and task state and
     supports resume."""
-
+    '''这个类负责：
+        接单
+        |
+        验证
+        |
+        创建任务
+        |
+        启动 workflow
+        |
+        管理生命周期
+    '''
     async def call(self, meta, script_fn, args=None, resume_from_run_id=None):
+        '''meta是workflow描述，包括name,description,phases；script_fn是真正workflow函数，比如sample_workflow流程图'''
         validate_meta(meta)
         check_permission(meta)
-        resuming = resume_from_run_id is not None
+        resuming = resume_from_run_id is not None #决定新运行还是恢复
         if resuming:
             run_id = validate_run_id(resume_from_run_id)
         else:
             run_id = reserve_run_id(meta)
-        with workflow_run_lock(run_id):
+        with workflow_run_lock(run_id): #防止两个agent同时工作
             return await self._call_locked(
                 meta, script_fn, args, run_id, resuming
             )
@@ -563,7 +575,7 @@ class WorkflowTool:
             elif args != saved_args:
                 raise WorkflowInputError("resume args do not match the original run")
             journal = WorkflowJournal(run_id, resume=True)
-        else:
+        else: #非恢复性任务
             args = args or {}
             journal = WorkflowJournal(run_id, resume=False)
         task_id = create_task_id(run_id)
@@ -573,16 +585,16 @@ class WorkflowTool:
         launched = {"status": "async_launched", "taskId": task_id,
                     "taskType": "local_workflow", "runId": run_id,
                     "workflowName": meta["name"]}
-        task.event("async_launched", runId=run_id, taskId=task_id)
+        task.event("async_launched", runId=run_id, taskId=task_id) #输出workflow start
         task.event("task_started", workflow=meta["name"],
                    phases=",".join(meta.get("phases", [])) or "-",
-                   resume=resuming)
+                   resume=resuming)#输出task start
         _write_json(STORE / f"{run_id}.json", {
             "runId": run_id,
             "workflowName": meta["name"],
             "args": args,
             "task": serialize_task(task),
-        })
+        }) #自动保存快照
 
         try:
             ctx = ExecutionState(
@@ -669,7 +681,7 @@ DEMO_CHANGES = (
     "    return db.execute(query).fetchone()\n"
 )
 
-
+# 对代码改动从多个维度做审查，再让另一个 Agent 验证这些问题是不是真的，最后只保留确认过的问题。是一个audit->verify的pipeline
 async def sample_workflow(ctx, args):
     """pipeline over review dimensions (audit -> verify-each), then keep only the
     findings a verifier confirms. The plan is code, not a chat turn."""
@@ -678,7 +690,7 @@ async def sample_workflow(ctx, args):
     if not isinstance(changes, str):
         raise WorkflowInputError("args.changes must be a string")
     review_input = changes.strip() or "No change context was supplied."
-
+    #第一个stage,audit
     async def audit(_value, dimension, _idx):
         out = await ctx.agent(
             f"Review this change context for {dimension} issues. "
@@ -686,7 +698,7 @@ async def sample_workflow(ctx, args):
             f"{review_input}",
             schema=FINDINGS_SCHEMA, label=f"audit:{dimension}", phase="Review")
         return {"dimension": dimension, "findings": out["findings"]}
-
+    #第二个stage,verify
     async def verify(audited, dimension, _idx):
         ctx.phase("Verify")
         # Each finding is verified by its own adversarial subagent, concurrently.
@@ -793,16 +805,16 @@ def install_workflow_tool(host):
     host.assemble_tool_pool = assemble_with_workflow
     host._workflow_tool_installed = True
 
-
+#动态把 s15 的 code.py 加载成一个 Python module
 def load_integrated_host():
     """Load s15 lazily so deterministic workflow tests need no API key."""
     path = Path(__file__).resolve().parents[1] / "s15_integrated_harness" / "code.py"
     spec = importlib.util.spec_from_file_location("integrated_host", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"unable to load integrated host from {path}")
-    host = importlib.util.module_from_spec(spec)
+    host = importlib.util.module_from_spec(spec) #先创建一个新的对象
     sys.modules[spec.name] = host
-    spec.loader.exec_module(host)
+    spec.loader.exec_module(host) #真正执行s15
     return host
 
 
@@ -832,7 +844,7 @@ async def run_demo(argv):
     print(f"\nstatus={task['status']}  agents={usage['agents']}  "
           f"tokens={usage['tokens']}  journal=.runtime/{task['runId']}.journal.jsonl")
 
-
+#加载s15并安装workflow插件
 def run_cli():
     """Run the cumulative s15 host with Workflow added to its tool pool."""
     host = load_integrated_host()

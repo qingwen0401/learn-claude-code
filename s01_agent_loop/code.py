@@ -67,6 +67,7 @@ TOOLS = [{
 
 # -- Tool execution --
 def run_bash(command: str) -> str:
+    """执行模型生成的 shell 命令，并把 stdout/stderr 统一转换为工具结果。"""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -83,6 +84,7 @@ def run_bash(command: str) -> str:
 
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
+    """核心 ReAct 循环：请求模型 -> 执行 tool_use -> 回填 tool_result，直到模型停止。"""
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
@@ -92,7 +94,8 @@ def agent_loop(messages: list):
         # Append assistant turn
         messages.append({"role": "assistant", "content": response.content})
 
-        # If the model didn't call a tool, we're done
+        # 没有 tool_use 表示模型进入最终回答；否则继续把工具结果喂回模型。
+        # 调用逻辑：assistant(response.content) -> run_bash -> user(tool_result) -> 下一轮。
         if response.stop_reason != "tool_use":
             return
 

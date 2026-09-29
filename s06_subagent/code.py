@@ -224,6 +224,7 @@ register_hook("Stop", summary_hook)
 
 
 def execute_tool(block, handlers: dict) -> str:
+    """执行一次工具调用并包住 Pre/Post hooks；父子 agent 共用此执行协议。"""
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
         return str(blocked)
@@ -245,6 +246,7 @@ SUB_HANDLERS = dict(BASE_HANDLERS)
 
 
 def extract_text(content) -> str:
+    """从模型 content block 中提取最终文本，作为子代理返回值。"""
     if not isinstance(content, list):
         return str(content)
     return "\n".join(
@@ -255,6 +257,7 @@ def extract_text(content) -> str:
 
 
 def run_subagent(prompt: str) -> str:
+    """启动隔离的子代理循环：新建 messages，只暴露基础工具，最终仅返回文本。"""
     print("\n\033[35m[Subagent started]\033[0m")
     messages = [{"role": "user", "content": prompt}]
 
@@ -310,6 +313,7 @@ TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 # -- Parent agent loop --
 
 def agent_loop(messages: list):
+    """父代理循环；task 工具通过 run_subagent 把工作委派到独立上下文。"""
     while True:
         response = client.messages.create(
             model=MODEL,

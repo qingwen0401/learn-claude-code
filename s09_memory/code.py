@@ -86,6 +86,7 @@ def memory_slug(name: str) -> str:
     return slug or "memory"
 
 def memory_path(filename: str, allow_index: bool = False) -> Path:
+    """校验记忆文件名和目录边界，防止记忆读写越出工作区。"""
     if Path(filename).name != filename:
         raise ValueError(f"Invalid memory filename: {filename}")
     if filename == MEMORY_INDEX.name and not allow_index:
@@ -147,6 +148,7 @@ def memory_document(name: str, mem_type: str, description: str, body: str) -> st
     return f"---\n{metadata}\n---\n\n{body.strip()}\n"
 
 def write_memory_file(name: str, mem_type: str, description: str, body: str) -> Path:
+    """以 front matter + 正文格式持久化一条记忆，并重建 MEMORY.md 索引。"""
     if not name.strip():
         raise ValueError("Memory name cannot be empty")
     if mem_type not in MEMORY_TYPES:
@@ -161,6 +163,7 @@ def write_memory_file(name: str, mem_type: str, description: str, body: str) -> 
     return path
 
 def rebuild_memory_index() -> None:
+    """扫描记忆记录生成轻量索引，供启动提示和召回选择使用。"""
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     lines = []
     for path in sorted(MEMORY_DIR.glob("*.md")):
@@ -196,6 +199,7 @@ def read_memory_file(filename: str) -> str | None:
     return path.read_text() if path.is_file() else None
 
 def list_memory_files() -> list[dict]:
+    """读取所有记忆记录的元数据和正文，过滤索引文件及非法路径。"""
     records = []
     if not MEMORY_DIR.exists():
         return records
@@ -217,7 +221,7 @@ def list_memory_files() -> list[dict]:
     return records
 
 # -- Recall --
-
+#解析block中的text type为str
 def block_text(block) -> str:
     if isinstance(block, dict):
         return str(block.get("text", "")) if block.get("type") == "text" else ""
@@ -226,7 +230,7 @@ def block_text(block) -> str:
         if getattr(block, "type", None) == "text"
         else ""
     )
-
+#解析message中的content为str
 def message_text(message: dict) -> str:
     content = message.get("content", "")
     if isinstance(content, str):
@@ -234,7 +238,7 @@ def message_text(message: dict) -> str:
     if isinstance(content, list):
         return "\n".join(filter(None, (block_text(block) for block in content)))
     return ""
-
+#将llm返回的【0，2】list提取出来的工具
 def extract_json_array(text: str) -> list:
     decoder = json.JSONDecoder()
     for position, character in enumerate(text):
@@ -247,7 +251,7 @@ def extract_json_array(text: str) -> list:
         if isinstance(value, list):
             return value
     return []
-
+#近期三个user role message
 def recent_user_text(messages: list, max_turns: int = 3) -> str:
     turns = []
     for message in reversed(messages):
@@ -259,23 +263,24 @@ def recent_user_text(messages: list, max_turns: int = 3) -> str:
         if len(turns) == max_turns:
             break
     return "\n".join(reversed(turns))[:4000]
-
+#关键词匹配（兜底），其中打分逻辑有点绕
 def keyword_memory_selection(
     records: list[dict], query: str, max_items: int
 ) -> list[str]:
     words = set(
         re.findall(r"[a-z0-9_]{3,}|[\u4e00-\u9fff]{2,}", query.lower())
-    )
+    ) #无序不重复set
     ranked = []
     for record in records:
         catalog_text = f"{record['name']} {record['description']}".lower()
         score = sum(word in catalog_text for word in words)
         if score:
             ranked.append((score, record["filename"]))
-    ranked.sort(key=lambda item: (-item[0], item[1]))
+    ranked.sort(key=lambda item: (-item[0], item[1])) #score降序，再filename升序
     return [filename for _, filename in ranked[:max_items]]
-
+#递给LLM，试图让它返回[0,2]list，代表对应memory catalog序号
 def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
+    """先让 LLM 从目录选择相关记忆，解析失败时回退到关键词匹配。"""
     records = list_memory_files()
     query = recent_user_text(messages)
     if not records or not query:
@@ -313,8 +318,9 @@ def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
         return selected
     except Exception:
         return keyword_memory_selection(records, query, max_items)
-
+#限制大小地将召回的相应index输出为str
 def load_memories(messages: list) -> str:
+    """加载召回文件并限制总字符数，作为当前请求的背景上下文。"""
     loaded = []
     remaining = RECALL_CHAR_LIMIT
     for filename in select_relevant_memories(messages):
@@ -325,7 +331,7 @@ def load_memories(messages: list) -> str:
         loaded.append({"source": filename, "content": recalled})
         remaining -= len(recalled)
     return json.dumps(loaded, ensure_ascii=False, indent=2) if loaded else ""
-
+#真正把load后召回的东西写入主llm
 def build_system(relevant_memories: str = "") -> str:
     index = read_memory_index()
     sections = [
@@ -347,7 +353,7 @@ def build_system(relevant_memories: str = "") -> str:
     return "\n\n".join(sections)
 
 # -- Extract and consolidate --
-
+#提取近12条text信息
 def dialogue_text(messages: list, max_messages: int = 12) -> str:
     lines = []
     for message in messages[-max_messages:]:
@@ -355,10 +361,11 @@ def dialogue_text(messages: list, max_messages: int = 12) -> str:
         if text:
             lines.append(f"{message.get('role', 'unknown')}: {text}")
     return "\n".join(lines)[:8000]
-
+#验证，用于提取和后期整理
 def validate_memory_record(
     record, require_scope: bool = False
 ) -> dict | None:
+    """校验模型提取的记忆结构、类型和作用域，拒绝空或临时数据。"""
     if not isinstance(record, dict):
         return None
     name = str(record.get("name", "")).strip()
@@ -380,8 +387,9 @@ def validate_memory_record(
     if scope:
         validated["scope"] = scope
     return validated
-
+#与一个独立LLM交互判断哪些信息是需要提取并候选写盘的，输出候选数量，并写盘
 def extract_memories(messages: list) -> int:
+    """从近期对话提取可跨会话复用的信息，去重后写入记忆目录。"""
     dialogue = dialogue_text(messages)
     if not dialogue:
         return 0
@@ -444,8 +452,9 @@ def extract_memories(messages: list) -> int:
     except Exception as error:
         print(f"\n\033[33m[Memory extraction skipped: {error}]\033[0m")
         return 0
-
+#用一个独立LLM合并重复和过期内容,代码难点在写新文件时要把旧文件都删掉，所以要提供rollback方案，即保存旧文件snapshot
 def consolidate_memories() -> int:
+    """记录达到阈值后调用独立 LLM 合并重复/过期记忆，并更新索引。"""
     records = list_memory_files()
     if len(records) < CONSOLIDATE_THRESHOLD:
         return 0
@@ -506,7 +515,7 @@ def consolidate_memories() -> int:
                     record["type"],
                     record["description"],
                     record["body"],
-                ))
+                )) #由于用write_text不用每次都重建索引，更高效
             rebuild_memory_index()
         except Exception:
             for path in MEMORY_DIR.glob("*.md"):
@@ -682,6 +691,7 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
 def execute_tool(block) -> str:
+    """执行记忆 agent 的工具调用，并统一应用权限、日志和输出 hooks。"""
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
         return str(blocked)
@@ -698,8 +708,9 @@ def execute_tool(block) -> str:
 # -- Agent loop --
 
 def agent_loop(messages: list):
-    relevant_memories = load_memories(messages)
-    system = build_system(relevant_memories)
+    """每轮先召回相关记忆，结束后提取/巩固持久知识，再继续普通工具循环。"""
+    relevant_memories = load_memories(messages) #用户发一次请求就recall一次
+    system = build_system(relevant_memories) #把召回的相应memory写进sysprompt里面
 
     while True:
         response = client.messages.create(
@@ -719,6 +730,7 @@ def agent_loop(messages: list):
             if force:
                 messages.append({"role": "user", "content": force})
                 continue
+            #任务结束时extract
             if extract_memories(messages):
                 consolidate_memories()
             return

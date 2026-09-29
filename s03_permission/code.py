@@ -141,6 +141,7 @@ TOOL_HANDLERS = {
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
 
 def check_deny_list(command: str) -> str | None:
+    """Gate 1：命中绝对禁止模式立即拒绝，不询问用户。"""
     for pattern in DENY_LIST:
         if pattern in command:
             return f"Blocked: '{pattern}' is on the deny list"
@@ -158,6 +159,7 @@ PERMISSION_RULES = [
 ]
 
 def check_rules(tool_name: str, args: dict) -> str | None:
+    """Gate 2：按工具和参数匹配上下文风险规则，返回审批原因。"""
     for rule in PERMISSION_RULES:
         if tool_name in rule["tools"] and rule["check"](args):
             return rule["message"]
@@ -166,6 +168,7 @@ def check_rules(tool_name: str, args: dict) -> str | None:
 
 # Gate 3: User approval - wait for confirmation after rule match
 def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    """Gate 3：向用户展示风险并同步等待 allow/deny 决策。"""
     print(f"\n\033[33m[permission] {reason}\033[0m")
     print(f"   Tool: {tool_name}({args})")
     choice = input("   Allow? [y/N] ").strip().lower()
@@ -174,6 +177,7 @@ def ask_user(tool_name: str, args: dict, reason: str) -> str:
 
 # Pipeline: all three gates chained
 def check_permission(block) -> bool:
+    """串联三道门；False 会生成拒绝型 tool_result，且不会执行真实工具。"""
     if block.name == "bash":
         reason = check_deny_list(block.input.get("command", ""))
         if reason:
@@ -190,6 +194,7 @@ def check_permission(block) -> bool:
 # -- Agent loop: same as s02, with check_permission() inserted --
 
 def agent_loop(messages: list):
+    """在 s02 工具分发前插入权限检查，保持消息循环协议不变。"""
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,

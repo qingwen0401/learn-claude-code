@@ -39,10 +39,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MAX_TOKENS = 8000
-DEFAULT_EVALUATOR_MAX_TOKENS = 512
-DEFAULT_STOP_HOOK_BLOCK_CAP = 8
-MAX_GOAL_LENGTH = 4000
+DEFAULT_MAX_TOKENS = 8000  #worker最多8000token
+DEFAULT_EVALUATOR_MAX_TOKENS = 512  #evaluator最多512token
+DEFAULT_STOP_HOOK_BLOCK_CAP = 8 #stop hook最多允许8个block
+MAX_GOAL_LENGTH = 4000 #goal最长4000个字符
 CLEAR_ALIASES = {"clear", "stop", "off", "reset", "none", "cancel"}
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
 DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
@@ -52,29 +52,29 @@ class GoalError(Exception):
     """The goal command or evaluator could not be used safely."""
 
 
-@dataclass
+@dataclass #和workflow runstate很像，但这里保存的是goal的状态
 class GoalState:
     condition: str
     iterations: int
-    set_at: float
-    tokens_at_start: int
+    set_at: float #设置goal的时间，后面用来算elapsed time
+    tokens_at_start: int #设置 goal 时，Session 已经用了多少 token
     last_reason: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True) #evaluator的返回结果，ok表示goal是否达成，reason是解释，impossible表示goal是否不可能达成
 class GoalEvaluation:
     ok: bool
     reason: str
     impossible: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True) #StopDecision表示Stop hook返回AgentSession的决策，action是动作，reason是解释
 class StopDecision:
     action: str
     reason: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True) #SessionResult表示AgentSession.submit给CLI的返回结果，text是模型输出，status是状态，reason是解释
 class SessionResult:
     text: str
     status: str
@@ -111,7 +111,7 @@ def _usage_total(response: Any) -> int:
         getattr(usage, "output_tokens", 0) or 0
     )
 
-
+#处理 text、tool_use 和 tool_result，从而看完整conversation
 def _plain_content(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -136,7 +136,7 @@ def _plain_content(content: Any) -> str:
             )
     return "\n".join(part for part in parts if part)
 
-
+#给evaluator准备上下文，返回最近的完整消息，去掉过大的最新消息
 def transcript_text(
     messages: list[dict[str, Any]], max_characters: int = 24000
 ) -> str:
@@ -167,7 +167,14 @@ def transcript_text(
         size += item_size
     return "\n\n".join(reversed(selected))
 
-
+#Evaluator 的 schema validator
+'''
+必须是 dict
+ok 必须 bool
+reason 必须非空字符串
+impossible 必须 bool
+不能同时 ok=true 和 impossible=true
+'''
 def _parse_json_object(text: str) -> dict[str, Any]:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -200,7 +207,7 @@ def _parse_json_object(text: str) -> dict[str, Any]:
         "impossible": impossible,
     }
 
-
+#独立验收agent的结果，判断goal是否达成
 class PromptGoalEvaluator:
     """A separate, tool-free model that judges the transcript."""
 
@@ -224,7 +231,7 @@ class PromptGoalEvaluator:
     def _evaluate_sync(
         self, condition: str, messages: list[dict[str, Any]]
     ) -> GoalEvaluation:
-        conversation = transcript_text(messages)
+        conversation = transcript_text(messages) #历史处理后塞进上下文
         payload = json.dumps(
             {
                 "completion_condition": condition,
@@ -257,7 +264,7 @@ Return only JSON:
         value = _parse_json_object(_extract_text(response.content))
         return GoalEvaluation(**value)
 
-
+#goal的状态机，保存goal的状态，处理Stop hook的决策
 class GoalController:
     """Session-scoped goal state plus the Stop hook decision."""
 
@@ -269,16 +276,16 @@ class GoalController:
     ):
         if block_cap < 1:
             raise GoalError("block_cap must be at least 1")
-        self.evaluator = evaluator
-        self.block_cap = block_cap
-        self.events = events if events is not None else []
-        self.active: GoalState | None = None
+        self.evaluator = evaluator #谁负责验收
+        self.block_cap = block_cap #stop hook最多允许打回的block数
+        self.events = events if events is not None else []#goal历史事件
+        self.active: GoalState | None = None #当前goal的状态
         self.last_status: dict[str, Any] | None = None
         self.consecutive_blocks = 0
 
     def begin_query(self) -> None:
         self.consecutive_blocks = 0
-
+    #设置goal（去空格、设置长度等），返回GoalState
     def set_goal(self, condition: str, tokens_at_start: int = 0) -> GoalState:
         condition = condition.strip()
         if not condition:
@@ -303,7 +310,7 @@ class GoalController:
         self.consecutive_blocks = 0
         self._record(active=True, met=False, failed=False, reason="goal set")
         return self.active
-
+    #如果输入/goal clear
     def clear(self, reason: str = "cleared") -> str:
         if self.active is None:
             return "No goal set"
@@ -317,7 +324,7 @@ class GoalController:
         self.active = None
         self.consecutive_blocks = 0
         return f"Goal cleared: {condition}"
-
+    #如果输入/goal，返回当前goal的状态，如果没有goal，返回"No goal set"
     def status(self, current_tokens: int = 0) -> str:
         if self.active is None:
             if self.last_status and self.last_status.get("met"):
@@ -342,7 +349,7 @@ class GoalController:
         if self.active.last_reason:
             lines.append(f"Last reason: {self.active.last_reason}")
         return "\n".join(lines)
-
+    #Worker 已经不调用工具、准备停止的时候
     async def evaluate_after_turn(
         self,
         messages: list[dict[str, Any]],
@@ -395,7 +402,7 @@ class GoalController:
             self.active = None
             self.consecutive_blocks = 0
             return StopDecision("failed", evaluation.reason)
-
+        #Worker 想停，但 GoalController 不允许，叫stop hook强行停
         self.consecutive_blocks += 1
         self._record(
             active=True,
@@ -412,7 +419,7 @@ class GoalController:
                 ),
             )
         return StopDecision("block", evaluation.reason)
-
+    #保存Goal 的 event log
     def _record(
         self,
         *,
@@ -437,7 +444,7 @@ class GoalController:
         self.events.append(event)
         self.last_status = event
 
-    @classmethod
+    @classmethod #尝试从过去的 `goal_status` events 恢复
     def restore(
         cls,
         evaluator: Any,
@@ -524,7 +531,7 @@ TOOLS = [
     },
 ]
 
-
+#AgentSession 是Worker Runtime. 在返回边界处具有目标停止钩子。
 class AgentSession:
     """A small real agent loop with a goal Stop hook at the return boundary."""
 
@@ -558,7 +565,7 @@ class AgentSession:
         self.register_hook("PostToolUse", self._large_output_hook)
         self.register_hook("UserPromptSubmit", self._context_hook)
         self.register_hook("Stop", self._summary_hook)
-
+    #所有用户输入的入口
     async def submit(self, text: str) -> SessionResult:
         stripped = text.strip()
         if stripped == "/goal":
@@ -806,7 +813,7 @@ class AgentSession:
 
         raise GoalError(f"unknown tool '{name}'")
 
-
+#把所有零件组装成真正可运行 Agent
 def make_live_session(workdir: Path) -> AgentSession:
     try:
         from anthropic import Anthropic

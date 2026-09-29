@@ -69,23 +69,26 @@ class Task:
     subject: str
     description: str
     status: str
-    owner: str | None
+    owner: str | None #负责当前任务的agent
     blockedBy: list[str]
 
 
 class TaskStore:
+    """把任务状态持久化为工作区内 JSON 文件，并集中校验 ID、依赖和状态。"""
     def __init__(self, directory: Path):
         self.directory = directory
-
+#创建根目录
     def _root(self, create: bool = False) -> Path:
+        """取得任务根目录并确保它仍位于工作区内。"""
         if create:
             self.directory.mkdir(parents=True, exist_ok=True)
         root = self.directory.resolve()
         if not root.is_relative_to(WORKDIR.resolve()):
             raise ValueError("Task store escapes the workspace")
         return root
-
+#创建具体task路径
     def _path(self, task_id: str, create_root: bool = False) -> Path:
+        """把合法 task_id 映射到安全的 JSON 路径，阻止路径穿越。"""
         if not isinstance(task_id, str) or not TASK_ID_PATTERN.fullmatch(task_id):
             raise ValueError(f"Invalid task ID: {task_id!r}")
         root = self._root(create=create_root)
@@ -93,17 +96,18 @@ class TaskStore:
         if not path.is_relative_to(root):
             raise ValueError(f"Invalid task ID: {task_id!r}")
         return path
-
+#判断某个id是否在路径中存在对应文件
     def exists(self, task_id: str) -> bool:
         return self._path(task_id).is_file()
-
+#创建写入task文件,输出一个创建的Task类型对象
     def create(self, subject: str, description: str = "",
                blocked_by: list[str] | None = None) -> Task:
+        """创建 pending 任务，校验依赖存在，并用独占创建处理 ID 冲突。"""
         subject = subject.strip()
         if not subject:
             raise ValueError("Task subject cannot be empty")
 
-        dependencies = list(dict.fromkeys(blocked_by or []))
+        dependencies = list(dict.fromkeys(blocked_by or []))#fromkeys是一种python常见去重方法
         for dependency in dependencies:
             if not self.exists(dependency):
                 raise ValueError(f"Dependency not found: {dependency}")
@@ -127,14 +131,16 @@ class TaskStore:
             except FileExistsError:
                 continue
         raise RuntimeError("Could not allocate a unique task ID")
-
+#保存一个Task到合法路径
     def save(self, task: Task) -> None:
+        """将任务状态写回 JSON 文件。"""
         self._path(task.id, create_root=True).write_text(
             json.dumps(asdict(task), indent=2),
             encoding="utf-8",
         )
-
+#读取一个合法Task
     def load(self, task_id: str) -> Task:
+        """读取并校验任务 ID 与状态，返回 Task 对象。"""
         data = json.loads(self._path(task_id).read_text(encoding="utf-8"))
         task = Task(**data)
         if task.id != task_id:
@@ -142,12 +148,13 @@ class TaskStore:
         if task.status not in ("pending", "in_progress", "completed"):
             raise ValueError(f"Invalid task status: {task.status}")
         return task
-
+#列出包含所有task对象的列表
     def list(self) -> list[Task]:
+        """枚举任务目录中的全部任务并按文件名稳定排序。"""
         if not self.directory.exists():
             return []
         root = self._root()
-        return [self.load(path.stem)
+        return [self.load(path.stem) #stem是文件名去掉后缀（即task id）
                 for path in sorted(root.glob("task_*.json"))]
 
 
@@ -170,8 +177,9 @@ def list_tasks() -> list[Task]:
 def get_task(task_id: str) -> str:
     return json.dumps(asdict(load_task(task_id)), indent=2)
 
-
+#列出所有未完成依赖的task id
 def incomplete_dependencies(task: Task) -> list[str]:
+    """返回尚未 completed 的依赖；缺失依赖也视为阻塞。"""
     incomplete = []
     for dependency in task.blockedBy:
         try:
@@ -181,12 +189,14 @@ def incomplete_dependencies(task: Task) -> list[str]:
             incomplete.append(dependency)
     return incomplete
 
-
+#只检查依赖现在是否完备，不检查现在任务状态
 def can_start(task_id: str) -> bool:
+    """只有所有 blockedBy 任务完成时才允许领取。"""
     return not incomplete_dependencies(load_task(task_id))
 
-
+#任务状态从pending转化成in_progress
 def claim_task(task_id: str, owner: str = "agent") -> str:
+    """原子语义地把 pending 任务领取为 in_progress，并记录 owner。"""
     task = load_task(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
@@ -199,8 +209,9 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
     print(f"  [claim] {task.subject} -> in_progress (owner: {owner})")
     return f"Claimed {task.id} ({task.subject})"
 
-
+#任务状态从in_progress转化成completed
 def complete_task(task_id: str, owner: str = "agent") -> str:
+    """校验领取者后完成任务，并报告因此解除阻塞的后继任务。"""
     task = load_task(task_id)
     if task.status != "in_progress":
         return f"Task {task_id} is {task.status}, cannot complete"
@@ -215,6 +226,7 @@ def complete_task(task_id: str, owner: str = "agent") -> str:
     }
     task.status = "completed"
     TASKS.save(task)
+    #判断这个任务completed之后有哪些新任务满足了dependency(具备从pending到inprogress的条件)
     unblocked = [candidate.subject for candidate in list_tasks()
                  if candidate.status == "pending"
                  and candidate.blockedBy
@@ -323,7 +335,7 @@ def run_list_tasks() -> str:
         )
     return "\n".join(lines)
 
-
+#和list区别：加载完整，包括description
 def run_get_task(task_id: str) -> str:
     return get_task(task_id)
 
@@ -462,6 +474,7 @@ register_hook("Stop", summary_hook)
 
 
 def execute_tool(block) -> str:
+    """执行任务工具并通过 hooks；工具层只负责适配 TaskStore 的领域函数。"""
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
         return str(blocked)
@@ -479,6 +492,7 @@ def execute_tool(block) -> str:
 # -- Agent loop --
 
 def agent_loop(messages: list):
+    """通过 create/list/get/claim/complete 工具驱动持久化任务 DAG。"""
     while True:
         response = client.messages.create(
             model=MODEL,

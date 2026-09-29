@@ -108,10 +108,12 @@ def run_glob(pattern: str) -> str:
 # -- New in s05: structured state the model updates --
 
 class TodoManager:
+    """维护结构化任务状态；update 负责校验替换，render 负责给模型可读反馈。"""
     def __init__(self):
         self.items: list[dict] = []
 
     def update(self, todos: list | str) -> str:
+        """解析 JSON/Python 字符串并校验任务约束，然后原子替换当前列表。"""
         if isinstance(todos, str):
             try:
                 todos = json.loads(todos)
@@ -149,6 +151,7 @@ class TodoManager:
         return self.render()
 
     def render(self) -> str:
+        """把 pending/in_progress/completed 渲染为标记列表和完成计数。"""
         if not self.items:
             return "No todos."
 
@@ -170,6 +173,7 @@ TODO = TodoManager()
 
 
 def run_todo_write(todos: list | str) -> str:
+    """todo_write 的工具适配层：更新全局 TODO，并把结果返回给模型。"""
     try:
         output = TODO.update(todos)
     except ValueError as e:
@@ -276,6 +280,7 @@ register_hook("Stop", summary_hook)
 # -- Agent loop with the reminder counter --
 
 def agent_loop(messages: list):
+    """在工具循环中跟踪 todo 使用次数，连续三轮未更新时注入 reminder。"""
     rounds_since_todo = 0
     while True:
         response = client.messages.create(

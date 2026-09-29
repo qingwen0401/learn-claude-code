@@ -72,6 +72,8 @@ KEEP_RECENT_TOOL_RESULTS = 3
 PERSIST_THRESHOLD = 30000
 CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
 PROMPT = "\033[36ms15 >> \033[0m"
+# \001/\002 tell Readline the ANSI escapes have zero display width.
+READLINE_PROMPT = "\001\033[36m\002s15 >> \001\033[0m\002"
 CLI_ACTIVE = False
 
 
@@ -102,10 +104,17 @@ class ConsoleBroker:
     def __init__(self):
         self._lock = threading.Lock()
         self.reader = None
+        self.display_prompt = PROMPT
+        self.readline_prompt = READLINE_PROMPT
 
-    def ask(self, prompt: str) -> str:
+    def set_prompt(self, display_prompt: str, readline_prompt: str):
+        self.display_prompt = display_prompt
+        self.readline_prompt = readline_prompt
+
+    def ask(self, prompt: str | None = None) -> str:
         with self._lock:
-            return (self.reader or input)(prompt)
+            active_prompt = self.readline_prompt if prompt is None else prompt
+            return (self.reader or input)(active_prompt)
 
 
 CONSOLE = ConsoleBroker()
@@ -122,7 +131,7 @@ def terminal_print(text: str):
         except Exception:
             line = ""
     print(f"\r\033[K{text}")
-    print(PROMPT + line, end="", flush=True)
+    print(CONSOLE.display_prompt + line, end="", flush=True)
 
 # -- Task System --
 
@@ -149,7 +158,7 @@ def task_store_lock():
         depth = getattr(_task_store_state, "depth", 0)
         if depth == 0:
             TASKS_DIR.mkdir(parents=True, exist_ok=True)
-            handle = TASK_LOCK_PATH.open("a+")
+            handle = TASK_LOCK_PATH.open("a+", encoding="utf-8")
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             _task_store_state.handle = handle
         _task_store_state.depth = depth + 1
@@ -205,16 +214,11 @@ def _task_path(task_id: str) -> Path:
     return path
 
 
-def create_task(subject: str, description: str = "",
-                blockedBy: list[str] | None = None) -> Task:
+def create_task(subject: str, description: str = "") -> Task:
     subject = subject.strip()
     if not subject:
         raise ValueError("Task subject cannot be empty")
-    dependencies = list(dict.fromkeys(blockedBy or []))
     with task_store_lock():
-        for dependency in dependencies:
-            if not _task_path(dependency).is_file():
-                raise ValueError(f"Dependency not found: {dependency}")
         for _ in range(100):
             task = Task(
                 id=f"task_{secrets.token_hex(4)}",
@@ -222,7 +226,7 @@ def create_task(subject: str, description: str = "",
                 description=description,
                 status="pending",
                 owner=None,
-                blockedBy=dependencies,
+                blockedBy=[],
             )
             try:
                 with _task_path(task.id).open("x", encoding="utf-8") as handle:
@@ -231,6 +235,55 @@ def create_task(subject: str, description: str = "",
             except FileExistsError:
                 continue
     raise RuntimeError("Could not allocate a unique task ID")
+
+
+def _task_depends_on(task_id: str, target_id: str) -> bool:
+    """Return whether task_id transitively depends on target_id."""
+    pending = [task_id]
+    visited = set()
+    while pending:
+        current = pending.pop()
+        if current == target_id:
+            return True
+        if current in visited:
+            continue
+        visited.add(current)
+        pending.extend(load_task(current).blockedBy)
+    return False
+
+
+def update_task(task_id: str, addBlockedBy: list[str]) -> Task:
+    """Add dependency edges after create_task has returned real task IDs."""
+    if not isinstance(addBlockedBy, list):
+        raise ValueError("addBlockedBy must be a list of task IDs")
+
+    with task_store_lock():
+        task = load_task(task_id)
+        if task.status != "pending" or task.owner is not None:
+            raise ValueError(
+                f"Task {task_id} dependencies can only be updated while "
+                "pending and unowned"
+            )
+
+        dependencies = list(dict.fromkeys(addBlockedBy))
+        for dependency in dependencies:
+            if dependency == task_id:
+                raise ValueError("Task cannot depend on itself")
+            if not _task_path(dependency).is_file():
+                raise ValueError(f"Dependency not found: {dependency}")
+            if dependency not in task.blockedBy and _task_depends_on(
+                dependency, task_id
+            ):
+                raise ValueError(
+                    f"Dependency cycle detected: {task_id} -> {dependency}"
+                )
+
+        task.blockedBy.extend(
+            dependency for dependency in dependencies
+            if dependency not in task.blockedBy
+        )
+        save_task(task)
+        return task
 
 
 def save_task(task: Task):
@@ -401,7 +454,7 @@ def _run_git(args: list[str], cwd: Path | None = None) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             ["git", *args], cwd=cwd or WORKDIR,
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, errors="replace", timeout=30,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -661,32 +714,50 @@ SKILL_REGISTRY: dict[str, dict] = {}
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    if not text.startswith("---"):
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
         return {}, text
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+
+    closing_index = next(
+        (index for index, line in enumerate(lines[1:], start=1)
+         if line.rstrip("\r\n") == "---"),
+        None,
+    )
+    if closing_index is None:
         return {}, text
+
+    frontmatter = "".join(lines[1:closing_index])
+    body = "".join(lines[closing_index + 1:]).strip()
     try:
-        meta = yaml.safe_load(parts[1]) or {}
+        meta = yaml.safe_load(frontmatter) or {}
     except yaml.YAMLError:
         meta = {}
-    return meta, parts[2].strip()
+    if not isinstance(meta, dict):
+        meta = {}
+    return meta, body
 
 
 def scan_skills():
     SKILL_REGISTRY.clear()
     if not SKILLS_DIR.exists():
         return
+    skills_root = SKILLS_DIR.resolve()
     for directory in sorted(SKILLS_DIR.iterdir()):
         if not directory.is_dir():
             continue
         manifest = directory / "SKILL.md"
         if not manifest.exists():
             continue
-        raw = manifest.read_text()
-        meta, _ = _parse_frontmatter(raw)
-        name = meta.get("name", directory.name)
-        desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
+        if not manifest.resolve().is_relative_to(skills_root):
+            continue
+        raw = manifest.read_text(encoding="utf-8")
+        meta, body = _parse_frontmatter(raw)
+        raw_name = meta.get("name")
+        name = raw_name.strip() if isinstance(raw_name, str) else ""
+        name = name or directory.name
+        raw_desc = meta.get("description")
+        desc = raw_desc.strip() if isinstance(raw_desc, str) else ""
+        desc = desc or body.split("\n", 1)[0].lstrip("#").strip()
         SKILL_REGISTRY[name] = {
             "name": name,
             "description": desc,
@@ -719,12 +790,18 @@ PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
     "tools": "Available tools: bash, read_file, write_file, edit_file, glob, "
              "todo_write, task, load_skill, compact, "
-             "create_task, list_tasks, get_task, claim_task, complete_task, "
+             "create_task, update_task, list_tasks, get_task, claim_task, "
+             "complete_task, "
              "schedule_cron, list_crons, cancel_cron, "
              "spawn_teammate, list_teammates, send_message, "
              "request_shutdown, request_plan, review_plan, "
              "create_worktree, "
              "connect_mcp. MCP tools are prefixed mcp__{server}__{tool}.",
+    "tasks": (
+        "Create all task nodes first. Only after create_task returns "
+        "runtime-generated IDs, use update_task with those exact IDs to add "
+        "dependencies. Only the Lead changes task dependencies."
+    ),
     "teams": (
         "When parallel work would help, first propose a small team with clear "
         "responsibilities and wait for the user's confirmation. Do not call "
@@ -759,6 +836,7 @@ def assemble_system_prompt(context: dict) -> str:
     # memory, skill catalog, MCP state, and active teammates become visible.
     sections = [PROMPT_SECTIONS["identity"],
                 PROMPT_SECTIONS["tools"],
+                PROMPT_SECTIONS["tasks"],
                 PROMPT_SECTIONS["teams"],
                 PROMPT_SECTIONS["workspace"],
                 PROMPT_SECTIONS["memory"],
@@ -825,7 +903,7 @@ def _run_bash_process(command: str, cwd: Path | None = None) -> tuple[str, int |
         process = subprocess.Popen(
             command, shell=True, cwd=cwd or WORKDIR,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, start_new_session=True,
+            text=True, errors="replace", start_new_session=True,
         )
         with _shell_process_lock:
             _shell_processes.add(process)
@@ -865,7 +943,7 @@ def run_read(path: str, limit: int | None = None,
              offset: int = 0, cwd: Path | None = None) -> str:
     try:
         file_path = safe_path(path, cwd)
-        lines = file_path.read_text().splitlines()
+        lines = file_path.read_text(encoding="utf-8").splitlines()
         offset = max(int(offset or 0), 0)
         limit = int(limit) if limit is not None else None
         lines = lines[offset:]
@@ -880,7 +958,7 @@ def run_write(path: str, content: str, cwd: Path | None = None) -> str:
     try:
         fp = safe_path(path, cwd)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -890,10 +968,10 @@ def run_edit(path: str, old_text: str, new_text: str,
              cwd: Path | None = None) -> str:
     try:
         fp = safe_path(path, cwd)
-        text = fp.read_text()
+        text = fp.read_text(encoding="utf-8")
         if old_text not in text:
             return f"Error: text not found in {path}"
-        fp.write_text(text.replace(old_text, new_text, 1))
+        fp.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -903,11 +981,15 @@ def run_glob(pattern: str, cwd: Path | None = None) -> str:
     import glob as g
     try:
         base = (cwd or WORKDIR).resolve()
-        results = []
-        for match in g.glob(pattern, root_dir=base):
-            if (base / match).resolve().is_relative_to(base):
-                results.append(match)
-        return "\n".join(results) if results else "(no matches)"
+        matches = sorted({
+            match for match in g.glob(
+                pattern, root_dir=base, recursive=True)
+            if (base / match).resolve().is_relative_to(base)
+        })
+        shown = matches[:200]
+        if len(matches) > 200:
+            shown.append("... (more matches omitted; narrow the pattern)")
+        return "\n".join(shown) if shown else "(no matches)"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1013,7 +1095,7 @@ class MessageBus:
         inbox = self._path(agent)
         if not inbox.exists():
             return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+        msgs = [json.loads(line) for line in inbox.read_text(encoding="utf-8").splitlines()
                 if line.strip()]
         inbox.unlink()
         return msgs
@@ -1418,7 +1500,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str,
                                   "old_text": {"type": "string"},
                                   "new_text": {"type": "string"}},
                               "required": ["path", "old_text", "new_text"]}},
-            {"name": "glob", "description": "Find files by glob pattern.",
+            {"name": "glob", "description": "Find files by glob pattern; ** matches recursively.",
              "input_schema": {"type": "object",
                               "properties": {
                                   "pattern": {"type": "string"}},
@@ -1481,11 +1563,12 @@ def spawn_teammate_thread(name: str, role: str, prompt: str,
                          f"{type(exc).__name__}: {exc}", "error")
                 break
             messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason == "tool_use":
+            tool_calls = [
+                block for block in response.content if block.type == "tool_use"
+            ]
+            if tool_calls:
                 results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
+                for block in tool_calls:
                     output = _run_teammate_tool(name, block, sub_handlers)
                     results.append({"type": "tool_result",
                                     "tool_use_id": block.id,
@@ -1779,7 +1862,7 @@ SUB_TOOLS = [
                                      "old_text": {"type": "string"},
                                      "new_text": {"type": "string"}},
                       "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
+    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
      "input_schema": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
                       "required": ["pattern"]}},
@@ -1884,15 +1967,72 @@ def collect_tool_results(messages: list):
     return found
 
 
+def unseen_tool_result_positions(messages: list) -> set[tuple[int, int]]:
+    """Return results added since the model's most recent response."""
+    last_assistant = next(
+        (index for index in range(len(messages) - 1, -1, -1)
+         if messages[index].get("role") == "assistant"),
+        -1,
+    )
+    return {
+        (message_index, block_index)
+        for message_index in range(last_assistant + 1, len(messages))
+        if messages[message_index].get("role") == "user"
+        and isinstance(messages[message_index].get("content"), list)
+        for block_index, block in enumerate(messages[message_index]["content"])
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    }
+
+
+def persisted_output_path(output: str) -> str | None:
+    candidate = None
+    if output.startswith("<persisted-output>\n"):
+        candidate = next(
+            (line.removeprefix("Full output: ") for line in output.splitlines()
+             if line.startswith("Full output: ")),
+            None,
+        )
+    prefix = "[Earlier tool result saved at "
+    if output.startswith(prefix) and output.endswith("]"):
+        candidate = output.removeprefix(prefix).removesuffix("]")
+    if not candidate:
+        return None
+    path = Path(candidate)
+    if (not path.resolve().is_relative_to(TOOL_RESULTS_DIR.resolve())
+            or not path.is_file()):
+        return None
+    return str(path)
+
+
+def save_output(tool_use_id: str, output: str) -> Path:
+    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", str(tool_use_id))[:120] or "unknown"
+    path = TOOL_RESULTS_DIR / f"{safe_id}.txt"
+    path.write_text(output, encoding="utf-8")
+    return path
+
+
+def persisted_preview(tool_use_id: str, output: str,
+                      preview_chars: int = 2000) -> str:
+    saved_path = persisted_output_path(output)
+    if saved_path:
+        path = Path(saved_path)
+        try:
+            with path.open(encoding="utf-8") as saved:
+                preview = saved.read(preview_chars)
+        except OSError:
+            preview = output[:preview_chars]
+    else:
+        path = save_output(tool_use_id, output)
+        preview = output[:preview_chars]
+    return (f"<persisted-output>\nFull output: {path}\n"
+            f"Preview:\n{preview}\n</persisted-output>")
+
+
 def persist_large_output(tool_use_id: str, output: str) -> str:
     if len(output) <= PERSIST_THRESHOLD:
         return output
-    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
-    if not path.exists():
-        path.write_text(output)
-    return (f"<persisted-output>\nFull output: {path}\n"
-            f"Preview:\n{output[:2000]}\n</persisted-output>")
+    return persisted_preview(tool_use_id, output)
 
 
 def tool_result_budget(messages: list, max_bytes: int = 200_000) -> list:
@@ -1919,10 +2059,22 @@ def tool_result_budget(messages: list, max_bytes: int = 200_000) -> list:
     return messages
 
 
+def is_archive_marker(message: dict) -> bool:
+    content = message.get("content")
+    match = (re.fullmatch(r"\[\d+ messages archived at (.+)\]", content)
+             if isinstance(content, str) else None)
+    if not match:
+        return False
+    path = Path(match.group(1))
+    return (path.resolve().is_relative_to(TRANSCRIPT_DIR.resolve())
+            and path.is_file())
+
+
 def snip_compact(messages: list, max_messages: int = 50) -> list:
     if len(messages) <= max_messages:
         return messages
-    head_end, tail_start = 3, len(messages) - (max_messages - 3)
+    head_end = 3
+    tail_start = len(messages) - (max_messages - head_end - 1)
     if head_end > 0 and message_has_tool_use(messages[head_end - 1]):
         while head_end < len(messages) and is_tool_result_message(messages[head_end]):
             head_end += 1
@@ -1932,26 +2084,55 @@ def snip_compact(messages: list, max_messages: int = 50) -> list:
         tail_start -= 1
     if head_end >= tail_start:
         return messages
+    middle = messages[head_end:tail_start]
+    if len(middle) == 1 and is_archive_marker(middle[0]):
+        return messages
     snipped = tail_start - head_end
+    transcript = write_transcript(messages)
     return (messages[:head_end]
-            + [{"role": "user", "content": f"[snipped {snipped} messages]"}]
+            + [{"role": "user", "content":
+                f"[{snipped} messages archived at {transcript}]"}]
             + messages[tail_start:])
 
 
-def micro_compact(messages: list) -> list:
+def micro_compact(messages: list, target_chars: int | None = None) -> list:
     tool_results = collect_tool_results(messages)
-    if len(tool_results) <= KEEP_RECENT_TOOL_RESULTS:
-        return messages
-    for _, _, block in tool_results[:-KEEP_RECENT_TOOL_RESULTS]:
-        if len(str(block.get("content", ""))) > 120:
-            block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
+    unseen = unseen_tool_result_positions(messages)
+    consumed = [entry for entry in tool_results if entry[:2] not in unseen]
+    for _, _, block in consumed[:-KEEP_RECENT_TOOL_RESULTS]:
+        if target_chars is not None and estimate_size(messages) <= target_chars:
+            break
+        content = str(block.get("content", ""))
+        if len(content) <= 120:
+            continue
+        saved_path = persisted_output_path(content)
+        if not saved_path:
+            saved_path = str(save_output(
+                block.get("tool_use_id", "unknown"), content))
+        block["content"] = f"[Earlier tool result saved at {saved_path}]"
+    return messages
+
+
+def fit_tool_results(messages: list, target_chars: int) -> list:
+    results = [block for _, _, block in collect_tool_results(messages)]
+    for block in sorted(
+            results,
+            key=lambda item: len(str(item.get("content", ""))),
+            reverse=True):
+        if estimate_size(messages) <= target_chars:
+            break
+        output = str(block.get("content", ""))
+        replacement = persisted_preview(
+            block.get("tool_use_id", "unknown"), output, preview_chars=1000)
+        if len(replacement) < len(output):
+            block["content"] = replacement
     return messages
 
 
 def write_transcript(messages: list) -> Path:
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
-    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with path.open("w") as f:
+    path = TRANSCRIPT_DIR / f"transcript_{time.time_ns()}.jsonl"
+    with path.open("x", encoding="utf-8") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     return path
@@ -2079,8 +2260,6 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
 
 def start_background_task(block, handlers: dict) -> str:
     global _bg_counter
-    _bg_counter += 1
-    bg_id = f"bg_{_bg_counter:04d}"
     command = block.input.get("command", block.name)
     cwd, cwd_error = _agent_cwd()
 
@@ -2097,19 +2276,36 @@ def start_background_task(block, handlers: dict) -> str:
         except Exception as exc:
             result = f"Error: {type(exc).__name__}: {exc}"
             status = "failed"
-        trigger_hooks("PostToolUse", block, result)
+        try:
+            trigger_hooks("PostToolUse", block, result)
+        except Exception as exc:
+            result = (f"Error: PostToolUse hook failed: "
+                      f"{type(exc).__name__}: {exc}\n{result}")
+            status = "failed"
         with background_lock:
-            background_tasks[bg_id]["status"] = status
+            task = background_tasks.get(bg_id)
+            if task is None:
+                return
+            task["status"] = status
             background_results[bg_id] = str(result)
 
     with background_lock:
+        _bg_counter += 1
+        bg_id = f"bg_{_bg_counter:04d}"
         background_tasks[bg_id] = {
             "tool_use_id": block.id,
             "command": command,
             "status": "running",
             "cwd": str(cwd) if cwd else None,
         }
-    threading.Thread(target=worker, daemon=True).start()
+    thread = threading.Thread(target=worker, daemon=True)
+    try:
+        thread.start()
+    except Exception:
+        with background_lock:
+            background_tasks.pop(bg_id, None)
+            background_results.pop(bg_id, None)
+        raise
     print(f"  \033[33m[background] {bg_id}: {str(command)[:60]}\033[0m")
     return bg_id
 
@@ -2118,11 +2314,13 @@ def collect_background_results() -> list[str]:
     with background_lock:
         ready = [bg_id for bg_id, task in background_tasks.items()
                  if task["status"] in {"completed", "failed"}]
+        completed = [
+            (bg_id, background_tasks.pop(bg_id),
+             background_results.pop(bg_id, ""))
+            for bg_id in ready
+        ]
     notifications = []
-    for bg_id in ready:
-        with background_lock:
-            task = background_tasks.pop(bg_id)
-            output = background_results.pop(bg_id, "")
+    for bg_id, task, output in completed:
         summary = output[:200] if len(output) > 200 else output
         notifications.append(
             f"<task_notification>\n"
@@ -2250,7 +2448,7 @@ def save_durable_jobs():
     with cron_lock:
         durable = [asdict(job) for job in scheduled_jobs.values() if job.durable]
         temporary = DURABLE_PATH.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(durable, indent=2))
+        temporary.write_text(json.dumps(durable, indent=2), encoding="utf-8")
         os.replace(temporary, DURABLE_PATH)
 
 
@@ -2258,7 +2456,7 @@ def load_durable_jobs():
     if not DURABLE_PATH.exists():
         return
     try:
-        for item in json.loads(DURABLE_PATH.read_text()):
+        for item in json.loads(DURABLE_PATH.read_text(encoding="utf-8")):
             job = CronJob(**item)
             if not validate_cron(job.cron):
                 scheduled_jobs[job.id] = job
@@ -2567,12 +2765,22 @@ def run_create_worktree(name: str, task_id: str) -> str:
 
 # -- Basic Tool Handlers --
 
-def run_create_task(subject: str, description: str = "",
-                    blockedBy: list[str] | None = None) -> str:
-    task = create_task(subject, description, blockedBy)
-    deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
-    print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
-    return f"Created {task.id}: {task.subject}{deps}"
+def run_create_task(subject: str, description: str = "") -> str:
+    task = create_task(subject, description)
+    print(f"  \033[34m[create] {task.subject}\033[0m")
+    return f"Created {task.id}: {task.subject}"
+
+
+def run_update_task(task_id: str, addBlockedBy: list[str]) -> str:
+    try:
+        task = update_task(task_id, addBlockedBy)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    except FileNotFoundError:
+        return f"Error: Task {task_id} not found"
+    dependencies = ", ".join(task.blockedBy) or "(none)"
+    print(f"  \033[34m[update] {task.subject} blockedBy: {dependencies}\033[0m")
+    return f"Updated {task.id} blockedBy: {dependencies}"
 
 
 def run_list_tasks() -> str:
@@ -2662,7 +2870,7 @@ BUILTIN_TOOLS = [
                                      "old_text": {"type": "string"},
                                      "new_text": {"type": "string"}},
                       "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
+    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
      "input_schema": {"type": "object",
                       "properties": {"pattern": {"type": "string"}},
                       "required": ["pattern"]}},
@@ -2692,13 +2900,26 @@ BUILTIN_TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"focus": {"type": "string"}},
                       "required": []}},
-    {"name": "create_task", "description": "Create a task.",
+    {"name": "create_task",
+     "description": "Create a task and return its runtime-generated ID.",
      "input_schema": {"type": "object",
                       "properties": {"subject": {"type": "string"},
-                                     "description": {"type": "string"},
-                                     "blockedBy": {"type": "array",
-                                                   "items": {"type": "string"}}},
-                      "required": ["subject"]}},
+                                     "description": {"type": "string"}},
+                      "required": ["subject"],
+                      "additionalProperties": False}},
+    {"name": "update_task",
+     "description": "Add dependencies using IDs returned by create_task.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "task_id": {"type": "string",
+                                      "pattern": "^task_[0-9a-f]{8}$"},
+                          "addBlockedBy": {
+                              "type": "array",
+                              "items": {"type": "string",
+                                        "pattern": "^task_[0-9a-f]{8}$"},
+                              "minItems": 1}},
+                      "required": ["task_id", "addBlockedBy"],
+                      "additionalProperties": False}},
     {"name": "list_tasks", "description": "List all tasks.",
      "input_schema": {"type": "object", "properties": {}, "required": []}},
     {"name": "get_task", "description": "Get full task details.",
@@ -2795,7 +3016,8 @@ BUILTIN_HANDLERS = {
     "glob": run_agent_glob,
     "todo_write": run_todo_write, "task": spawn_subagent,
     "load_skill": load_skill,
-    "create_task": run_create_task, "list_tasks": run_list_tasks,
+    "create_task": run_create_task, "update_task": run_update_task,
+    "list_tasks": run_list_tasks,
     "get_task": run_get_task,
     "claim_task": run_claim_task, "complete_task": run_complete_task,
     "schedule_cron": run_schedule_cron,
@@ -2838,7 +3060,11 @@ def prepare_context(messages: list, active_request: str) -> list:
     # Every LLM turn enters through the same context budget pipeline.
     messages[:] = tool_result_budget(messages)
     messages[:] = snip_compact(messages)
-    messages[:] = micro_compact(messages)
+    if estimate_size(messages) > CONTEXT_LIMIT:
+        target = int(CONTEXT_LIMIT * 0.8)
+        messages[:] = micro_compact(messages, target)
+        if estimate_size(messages) > CONTEXT_LIMIT:
+            messages[:] = fit_tool_results(messages, target)
     if estimate_size(messages) > CONTEXT_LIMIT:
         messages[:] = compact_history(messages, active_request)
     return messages
@@ -2968,9 +3194,13 @@ def agent_loop(messages: list, context: dict, active_request: str):
                 continue
 
             if should_run_background(block.name, block.input):
-                bg_id = start_background_task(block, handlers)
-                output = (f"[Background task {bg_id} started] "
-                          "Result will arrive as a task_notification.")
+                try:
+                    bg_id = start_background_task(block, handlers)
+                    output = (f"[Background task {bg_id} started] "
+                              "Result will arrive as a task_notification.")
+                except Exception as exc:
+                    output = (f"Error: Failed to start background task: "
+                              f"{type(exc).__name__}: {exc}")
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": output})
@@ -3045,7 +3275,7 @@ if __name__ == "__main__":
                      args=(history, context, session_state), daemon=True).start()
     while True:
         try:
-            query = CONSOLE.ask(PROMPT)
+            query = CONSOLE.ask()
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
